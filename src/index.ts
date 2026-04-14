@@ -5,11 +5,15 @@ import { z } from "zod";
 type JobStatus = "pending" | "processing" | "done" | "failed";
 
 const JOB_TYPES = ["send_email", "sync_order", "cleanup"] as const;
-
 type JobType = (typeof JOB_TYPES)[number];
+
+type JobMessage = {
+  jobId: string;
+};
 
 type Env = {
   DB: D1Database;
+  JOB_QUEUE: Queue<JobMessage>;
   ADMIN_TOKEN: string;
 };
 
@@ -30,6 +34,7 @@ type JobRow = {
 
 const STALE_LOCK_MINUTES = 10;
 const CRON_BATCH_SIZE = 20;
+const MAX_QUEUE_DELAY_SECONDS = 12 * 60 * 60;
 const SENSITIVE_KEYS = ["email", "token", "phone", "password", "secret", "authorization"];
 
 const createJobSchema = z.object({
@@ -53,12 +58,13 @@ app.post("/jobs", async (c) => {
   const body = parsed.data;
   const id = crypto.randomUUID();
   const maxAttempts = body.max_attempts ?? 5;
+  const initialRunAt = body.run_at ? new Date(body.run_at) : new Date();
 
   try {
     await c.env.DB.prepare(
       `
       INSERT INTO jobs (id, type, payload, status, attempts, max_attempts, next_run_at, dedupe_key)
-      VALUES (?, ?, ?, 'pending', 0, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
+      VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)
       `
     )
       .bind(
@@ -66,7 +72,7 @@ app.post("/jobs", async (c) => {
         body.type,
         JSON.stringify(body.payload),
         maxAttempts,
-        body.run_at ?? null,
+        toSqliteDate(initialRunAt),
         body.dedupe_key ?? null
       )
       .run();
@@ -99,6 +105,11 @@ app.post("/jobs", async (c) => {
     }
 
     return jsonError(c, 500, "INTERNAL_ERROR", "Failed to create job");
+  }
+
+  const delaySeconds = getInitialQueueDelaySeconds(initialRunAt);
+  if (delaySeconds !== null) {
+    await enqueueJob(c.env, id, delaySeconds);
   }
 
   const created = await c.env.DB.prepare(
@@ -192,6 +203,8 @@ app.post("/jobs/:id/retry", async (c) => {
     return jsonError(c, 409, "CONFLICT", "Job is not retryable in current state");
   }
 
+  await enqueueJob(c.env, id, 0);
+
   const job = await c.env.DB.prepare(
     `
     SELECT id, type, status, attempts, max_attempts, next_run_at, created_at, updated_at
@@ -217,11 +230,113 @@ app.post("/jobs/:id/retry", async (c) => {
 
 async function handleScheduled(env: Env): Promise<void> {
   await recoverStaleJobs(env);
+  await enqueueDueJobs(env, CRON_BATCH_SIZE);
+}
 
-  const claimed = await claimDueJobs(env, CRON_BATCH_SIZE);
-  for (const job of claimed) {
-    await processJob(env, job);
+async function handleQueue(batch: MessageBatch<JobMessage>, env: Env): Promise<void> {
+  for (const message of batch.messages) {
+    const jobId = message.body?.jobId;
+    if (!jobId) {
+      continue;
+    }
+
+    await processQueuedJob(env, jobId);
   }
+}
+
+async function processQueuedJob(env: Env, jobId: string): Promise<void> {
+  const claimed = await claimJobForProcessing(env, jobId);
+  if (!claimed) {
+    return;
+  }
+
+  try {
+    const payload = parsePayload(claimed.payload);
+    await executeJob(claimed.type, payload, claimed.id);
+
+    await env.DB.prepare(
+      `
+      UPDATE jobs
+      SET status = 'done',
+          locked_at = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `
+    )
+      .bind(claimed.id)
+      .run();
+  } catch (error) {
+    const retryable = isRetryableError(error);
+    const nextAttempt = claimed.attempts + 1;
+    const errorMessage = extractErrorMessage(error);
+
+    if (retryable && nextAttempt < claimed.max_attempts) {
+      const { nextRunAt, delaySeconds } = buildRetrySchedule(nextAttempt);
+
+      await env.DB.prepare(
+        `
+        UPDATE jobs
+        SET status = 'pending',
+            attempts = attempts + 1,
+            next_run_at = ?,
+            last_error = ?,
+            locked_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        `
+      )
+        .bind(nextRunAt, errorMessage, claimed.id)
+        .run();
+
+      await enqueueJob(env, claimed.id, delaySeconds);
+      return;
+    }
+
+    await env.DB.prepare(
+      `
+      UPDATE jobs
+      SET status = 'failed',
+          attempts = attempts + 1,
+          last_error = ?,
+          locked_at = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `
+    )
+      .bind(errorMessage, claimed.id)
+      .run();
+  }
+}
+
+async function claimJobForProcessing(env: Env, jobId: string): Promise<JobRow | null> {
+  const claim = await env.DB.prepare(
+    `
+    UPDATE jobs
+    SET status = 'processing',
+        locked_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+      AND status = 'pending'
+      AND datetime(next_run_at) <= CURRENT_TIMESTAMP
+    `
+  )
+    .bind(jobId)
+    .run();
+
+  if (!claim.meta.changes) {
+    return null;
+  }
+
+  return env.DB.prepare(
+    `
+    SELECT id, type, payload, status, attempts, max_attempts, next_run_at, dedupe_key, locked_at, last_error, created_at, updated_at
+    FROM jobs
+    WHERE id = ?
+    LIMIT 1
+    `
+  )
+    .bind(jobId)
+    .first<JobRow>();
 }
 
 async function recoverStaleJobs(env: Env): Promise<void> {
@@ -241,88 +356,45 @@ async function recoverStaleJobs(env: Env): Promise<void> {
     .run();
 }
 
-async function claimDueJobs(env: Env, batchSize: number): Promise<JobRow[]> {
-  const claimResult = await env.DB.prepare(
+async function enqueueDueJobs(env: Env, batchSize: number): Promise<void> {
+  const result = await env.DB.prepare(
     `
-    WITH picked AS (
-      SELECT id
-      FROM jobs
-      WHERE status = 'pending'
-        AND datetime(next_run_at) <= CURRENT_TIMESTAMP
-      ORDER BY datetime(next_run_at) ASC
-      LIMIT ?
-    )
-    UPDATE jobs
-    SET status = 'processing',
-        locked_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id IN (SELECT id FROM picked)
-      AND status = 'pending'
-    RETURNING id, type, payload, status, attempts, max_attempts, next_run_at, dedupe_key, locked_at, last_error, created_at, updated_at
+    SELECT id
+    FROM jobs
+    WHERE status = 'pending'
+      AND datetime(next_run_at) <= CURRENT_TIMESTAMP
+    ORDER BY datetime(next_run_at) ASC
+    LIMIT ?
     `
   )
     .bind(batchSize)
-    .all<JobRow>();
+    .all<{ id: string }>();
 
-  return claimResult.results;
+  for (const row of result.results) {
+    await enqueueJob(env, row.id, 0);
+  }
 }
 
-async function processJob(env: Env, job: JobRow): Promise<void> {
-  try {
-    const payload = parsePayload(job.payload);
-    await executeJob(job.type, payload, job.id);
-
-    await env.DB.prepare(
-      `
-      UPDATE jobs
-      SET status = 'done',
-          locked_at = NULL,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-      `
-    )
-      .bind(job.id)
-      .run();
-  } catch (error) {
-    const retryable = isRetryableError(error);
-    const nextAttempt = job.attempts + 1;
-    const errorMessage = extractErrorMessage(error);
-
-    if (retryable && nextAttempt < job.max_attempts) {
-      const nextRunAt = buildNextRunAt(nextAttempt);
-
-      await env.DB.prepare(
-        `
-        UPDATE jobs
-        SET status = 'pending',
-            attempts = attempts + 1,
-            next_run_at = ?,
-            last_error = ?,
-            locked_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        `
-      )
-        .bind(nextRunAt, errorMessage, job.id)
-        .run();
-
-      return;
-    }
-
-    await env.DB.prepare(
-      `
-      UPDATE jobs
-      SET status = 'failed',
-          attempts = attempts + 1,
-          last_error = ?,
-          locked_at = NULL,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-      `
-    )
-      .bind(errorMessage, job.id)
-      .run();
+async function enqueueJob(env: Env, jobId: string, delaySeconds: number): Promise<void> {
+  if (delaySeconds > 0) {
+    await env.JOB_QUEUE.send({ jobId }, { delaySeconds: Math.min(delaySeconds, MAX_QUEUE_DELAY_SECONDS) });
+    return;
   }
+
+  await env.JOB_QUEUE.send({ jobId });
+}
+
+function getInitialQueueDelaySeconds(runAt: Date): number | null {
+  const seconds = Math.ceil((runAt.getTime() - Date.now()) / 1000);
+  if (seconds <= 0) {
+    return 0;
+  }
+
+  if (seconds > MAX_QUEUE_DELAY_SECONDS) {
+    return null;
+  }
+
+  return seconds;
 }
 
 async function executeJob(type: JobType, payload: Record<string, unknown>, jobId: string): Promise<void> {
@@ -352,10 +424,18 @@ async function executeJob(type: JobType, payload: Record<string, unknown>, jobId
   }
 }
 
-function buildNextRunAt(nextAttempt: number): string {
+function buildRetrySchedule(nextAttempt: number): { nextRunAt: string; delaySeconds: number } {
   const delaySeconds = Math.min(2 ** nextAttempt * 30, 3600) + randomInt(0, 10);
   const nextRunAt = new Date(Date.now() + delaySeconds * 1000);
-  return nextRunAt.toISOString();
+
+  return {
+    nextRunAt: toSqliteDate(nextRunAt),
+    delaySeconds
+  };
+}
+
+function toSqliteDate(date: Date): string {
+  return date.toISOString().slice(0, 19).replace("T", " ");
 }
 
 function randomInt(min: number, max: number): number {
@@ -441,6 +521,9 @@ class JobError extends Error {
 
 export default {
   fetch: app.fetch,
+  queue(batch: MessageBatch<JobMessage>, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(handleQueue(batch, env));
+  },
   scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(handleScheduled(env));
   }
