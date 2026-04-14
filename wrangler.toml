@@ -1,0 +1,14 @@
+name = "cf-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-14"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-worker-db"
+database_id = "e8e0f2cf-250b-4b08-a134-2a26c3f80cba"
+
+[vars]
+ADMIN_TOKEN = "replace-me"
